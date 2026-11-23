@@ -221,7 +221,7 @@ jobs:
           class StudyCalendar: CAPPlugin, CAPBridgedPlugin {
               let identifier = "StudyCalendar"
               let jsName = "StudyCalendar"
-              let pluginMethods = [CAPPluginMethod(name: "addPlan", returnType: CAPPluginReturnPromise)]
+              let pluginMethods: [CAPPluginMethod] = [CAPPluginMethod(name: "addPlan", returnType: CAPPluginReturnPromise)]
               private struct Session: Decodable {
                   let title: String
                   let notes: String
