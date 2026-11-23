@@ -189,7 +189,7 @@ jobs:
           npm install @capacitor/core@7 @capacitor/cli@7 "@capacitor/$PLATFORM@7"
           mkdir www
           echo '<!doctype html><title>Loading</title>' > www/index.html
-          node -e "const e=process.env; require('fs').writeFileSync('capacitor.config.json',JSON.stringify({appId:e.APP_ID,appName:e.TITLE,webDir:'www',server:{url:e.SITE}}))"
+          node -e "const e=process.env; require('fs').writeFileSync('capacitor.config.json',JSON.stringify({appId:e.APP_ID,appName:e.TITLE,webDir:'www',server:{url:e.SITE},ios:{zoomEnabled:true}}))"
           npx cap add "$PLATFORM"
           if [[ -n "$ICON" ]]; then
             mkdir assets
@@ -205,6 +205,103 @@ jobs:
       - name: Build unsigned IPA for personal signing
         if: matrix.target == 'ios' && (inputs.target == 'all' || inputs.target == 'ios')
         run: |
+          cat >> mobile/ios/App/App/AppDelegate.swift <<'SWIFT'
+
+          import Capacitor
+          import EventKit
+          import UIKit
+
+          class StudyBridgeController: CAPBridgeViewController {
+              override func capacitorDidLoad() {
+                  bridge?.registerPluginInstance(StudyCalendar())
+              }
+          }
+
+          @objc(StudyCalendar)
+          class StudyCalendar: CAPPlugin, CAPBridgedPlugin {
+              let identifier = "StudyCalendar"
+              let jsName = "StudyCalendar"
+              let pluginMethods = [CAPPluginMethod(name: "addPlan", returnType: CAPPluginReturnPromise)]
+              private struct Session: Decodable {
+                  let title: String
+                  let notes: String
+                  let start: Double
+              }
+
+              @objc func addPlan(_ call: CAPPluginCall) {
+                  guard #available(iOS 17, *) else {
+                      call.reject("Requires iPadOS 17 or later.")
+                      return
+                  }
+                  guard let json = call.getString("sessions"),
+                        let sessions = try? JSONDecoder().decode([Session].self, from: Data(json.utf8)),
+                        (1...366).contains(sessions.count), let first = sessions.first,
+                        let duration = call.getInt("duration"), [15,30,45,60].contains(duration),
+                        let alarm = call.getInt("alarm"), [0,5,10,30].contains(alarm) else {
+                      call.reject("Invalid study plan.")
+                      return
+                  }
+                  let vi = call.getString("language") == "vi"
+                  Task { @MainActor in
+                      guard let view = self.bridge?.viewController, view.presentedViewController == nil else {
+                          call.reject("Calendar is busy.")
+                          return
+                      }
+                      let prompt = UIAlertController(title: vi ? "Thêm vào Lịch Apple?" : "Add to Apple Calendar?",
+                          message: vi ? "Thêm \(sessions.count) buổi học vào lịch mặc định?" : "Add \(sessions.count) sessions to your default calendar?",
+                          preferredStyle: .alert)
+                      prompt.addAction(UIAlertAction(title: vi ? "Hủy" : "Cancel", style: .cancel) { _ in
+                          call.resolve(["saved": false])
+                      })
+                      prompt.addAction(UIAlertAction(title: vi ? "Thêm" : "Add", style: .default) { _ in
+                          Task { @MainActor in
+                              let store = EKEventStore()
+                              do {
+                                  guard try await store.requestWriteOnlyAccessToEvents(),
+                                        let calendar = store.defaultCalendarForNewEvents else {
+                                      call.reject(vi ? "Cho phép thêm sự kiện trong Cài đặt → Quyền riêng tư & Bảo mật → Lịch." : "Allow adding calendar events in Settings.")
+                                      return
+                                  }
+                                  for session in sessions {
+                                      let event = EKEvent(eventStore: store)
+                                      event.calendar = calendar
+                                      event.title = session.title
+                                      event.notes = session.notes
+                                      event.startDate = Date(timeIntervalSince1970: session.start)
+                                      event.endDate = event.startDate.addingTimeInterval(Double(duration * 60))
+                                      event.addAlarm(EKAlarm(relativeOffset: -Double(alarm * 60)))
+                                      try store.save(event, span: .thisEvent, commit: false)
+                                  }
+                                  try store.commit()
+                                  let date = Date(timeIntervalSince1970: first.start)
+                                  let url = URL(string: "calshow:\(Int(date.timeIntervalSinceReferenceDate))")!
+                                  let opened = await UIApplication.shared.open(url, options: [:])
+                                  call.resolve(["saved": true, "opened": opened])
+                              } catch {
+                                  store.reset()
+                                  call.reject(error.localizedDescription)
+                              }
+                          }
+                      })
+                      view.present(prompt, animated: true)
+                  }
+              }
+          }
+          SWIFT
+          python3 - <<'PY'
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+          p = Path('mobile/ios/App/App/Base.lproj/Main.storyboard')
+          tree = ET.parse(p)
+          vc = tree.find(".//*[@customClass='CAPBridgeViewController']")
+          if vc is None:
+              raise RuntimeError('Capacitor bridge controller missing from storyboard')
+          vc.set('customClass', 'StudyBridgeController')
+          vc.set('customModule', 'App')
+          vc.set('customModuleProvider', 'target')
+          tree.write(p, encoding='utf-8', xml_declaration=True)
+          PY
+          /usr/libexec/PlistBuddy -c "Add :NSCalendarsWriteOnlyAccessUsageDescription string Add your selected study sessions to Calendar." mobile/ios/App/App/Info.plist
           xcodebuild -workspace mobile/ios/App/App.xcworkspace -scheme App -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath ios-build CODE_SIGNING_ALLOWED=NO TARGETED_DEVICE_FAMILY=1,2 build
           mkdir Payload
           ditto ios-build/Build/Products/Release-iphoneos/App.app Payload/App.app
