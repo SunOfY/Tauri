@@ -83,6 +83,10 @@ jobs:
           c.productName = process.env.TITLE;
           c.app.windows[0].title = c.productName;
           c.app.windows[0].url = process.env.SITE;
+          if (process.env.PLATFORM === 'windows') {
+            c.app.windows[0].zoomHotkeysEnabled = true;
+            c.app.windows[0].create = false;
+          }
           delete c.build.beforeBuildCommand;
           delete c.build.beforeDevCommand;
           fs.mkdirSync('shell', {recursive:true});
@@ -91,6 +95,76 @@ jobs:
           fs.writeFileSync(file,JSON.stringify(c));
           JS
           if [[ -n "$ICON" ]]; then npm run tauri icon -- "../$ICON"; fi
+          if [[ "$PLATFORM" == windows ]]; then
+            cargo add --manifest-path src-tauri/Cargo.toml rfd@0.15 open@5
+            cat > src-tauri/src/lib.rs <<'RUST'
+          use rfd::{FileDialog, MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
+          use std::{collections::HashMap, path::{Path, PathBuf}, sync::Mutex};
+          use tauri::webview::DownloadEvent;
+          use tauri::Manager;
+
+          fn is_calendar(path: &Path) -> bool {
+              path.extension().and_then(|e| e.to_str())
+                  .is_some_and(|e| e.eq_ignore_ascii_case("ics"))
+          }
+
+          fn message(title: &str, detail: &str) {
+              MessageDialog::new().set_level(MessageLevel::Info)
+                  .set_title(title).set_description(detail).show();
+          }
+
+          pub fn run() {
+              tauri::Builder::default()
+                  .setup(|app| {
+                      let selected = Mutex::new(HashMap::<String, PathBuf>::new());
+                      tauri::WebviewWindowBuilder::from_config(app, &app.config().app.windows[0])?
+                          .on_download(move |_, event| {
+                              match event {
+                                  DownloadEvent::Requested { url, destination } if is_calendar(destination) => {
+                                      let mut dialog = FileDialog::new()
+                                          .set_title("Chọn nơi lưu lịch học")
+                                          .add_filter("iCalendar", &["ics"]);
+                                      if let Some(name) = destination.file_name().and_then(|s| s.to_str()) {
+                                          dialog = dialog.set_file_name(name);
+                                      }
+                                      let Some(path) = dialog.save_file() else { return false };
+                                      if !is_calendar(&path) {
+                                          message("Tên file lịch", "Hãy chọn tên kết thúc bằng .ics.");
+                                          return false;
+                                      }
+                                      selected.lock().unwrap().insert(url.to_string(), path.clone());
+                                      *destination = path;
+                                  }
+                                  DownloadEvent::Finished { url, path, success } => {
+                                      let chosen = selected.lock().unwrap().remove(url.as_str());
+                                      if let Some(chosen) = chosen {
+                                          if !success {
+                                              message("Lưu lịch", "Tải file lịch chưa thành công. Hãy thử lại.");
+                                          } else {
+                                              let saved = path.unwrap_or(chosen);
+                                              if is_calendar(&saved) {
+                                                  let open_now = MessageDialog::new()
+                                                      .set_title("Mở ứng dụng lịch?")
+                                                      .set_description(format!("Đã lưu lịch tại {}. Mở bằng ứng dụng lịch mặc định?", saved.display()))
+                                                      .set_buttons(MessageButtons::YesNo).show();
+                                                  if open_now == MessageDialogResult::Yes && open::that(&saved).is_err() {
+                                                      message("Mở lịch", &format!("Windows chưa mở được file. Chọn ứng dụng lịch cho file .ics rồi mở {}", saved.display()));
+                                                  }
+                                              }
+                                          }
+                                      }
+                                  }
+                                  _ => {}
+                              }
+                              true
+                          }).build()?;
+                      Ok(())
+                  })
+                  .run(tauri::generate_context!())
+                  .expect("failed to start application");
+          }
+          RUST
+          fi
           case "$PLATFORM" in
             windows) bundle=nsis; pattern='*-setup.exe' ;;
             linux) bundle=deb; pattern='*.deb' ;;
