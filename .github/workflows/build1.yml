@@ -1,0 +1,315 @@
+name: Build web app
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: Website HTTPS URL
+        required: true
+        default: https://sunofy.github.io/LearningChinese/
+      title:
+        description: App display name (letters, spaces, digits)
+        required: true
+        default: Learning Chinese
+      identifier:
+        description: Unique app ID (lowercase, e.g. com.sunofy.learningchinese)
+        required: true
+        default: com.sunofy.learningchinese
+      target:
+        type: choice
+        options: [all, windows, linux, macos, android, ios]
+        default: all
+      icon:
+        description: Optional square PNG file path in this repo
+        required: false
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+env:
+  SITE: ${{ inputs.url }}
+  TITLE: ${{ inputs.title }}
+  APP_ID: ${{ inputs.identifier }}
+  ICON: ${{ inputs.icon }}
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {target: windows, os: windows-2022}
+          - {target: linux, os: ubuntu-22.04}
+          - {target: macos, os: macos-15}
+          - {target: android, os: ubuntu-24.04}
+          - {target: ios, os: macos-15}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        if: inputs.target == 'all' || inputs.target == matrix.target
+      - uses: actions/setup-node@v4
+        if: inputs.target == 'all' || inputs.target == matrix.target
+        with:
+          node-version: 22
+      - name: Validate settings
+        if: inputs.target == 'all' || inputs.target == matrix.target
+        run: |
+          node --input-type=module <<'JS'
+          import fs from 'node:fs';
+          import path from 'node:path';
+          const {SITE,TITLE,APP_ID,ICON} = process.env;
+          const url = new URL(SITE);
+          if (url.protocol !== 'https:' || url.username || url.password) throw Error('Enter an HTTPS URL without credentials');
+          if (!/^[\p{L}\p{N}][\p{L}\p{N} -]{0,49}$/u.test(TITLE)) throw Error('Invalid display name');
+          if (!/^[a-z][a-z0-9]*(\.[a-z][a-z0-9]*){2,}$/.test(APP_ID)) throw Error('Invalid app identifier');
+          if (ICON && (!fs.realpathSync(ICON).startsWith(fs.realpathSync('.') + path.sep) || !/\.png$/i.test(ICON))) throw Error('Choose a PNG in this repository');
+          JS
+      - name: Install Linux desktop dependencies
+        if: matrix.target == 'linux' && (inputs.target == 'all' || inputs.target == 'linux')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libssl-dev libxdo-dev patchelf
+      - name: Build desktop app with Tauri
+        if: contains(fromJSON('["linux","macos","windows"]'), matrix.target) && (inputs.target == 'all' || inputs.target == matrix.target)
+        env:
+          PLATFORM: ${{ matrix.target }}
+        run: |
+          npx --yes create-tauri-app@4 wrapper --template vanilla --manager npm --identifier "$APP_ID" --yes
+          cd wrapper
+          npm install
+          node --input-type=module <<'JS'
+          import fs from 'node:fs';
+          const file = 'src-tauri/tauri.conf.json';
+          const c = JSON.parse(fs.readFileSync(file));
+          c.productName = process.env.TITLE;
+          c.app.windows[0].title = c.productName;
+          c.app.windows[0].url = process.env.SITE;
+          if (process.env.PLATFORM === 'windows') {
+            c.app.windows[0].zoomHotkeysEnabled = true;
+            c.app.windows[0].create = false;
+          }
+          delete c.build.beforeBuildCommand;
+          delete c.build.beforeDevCommand;
+          fs.mkdirSync('shell', {recursive:true});
+          fs.writeFileSync('shell/index.html','<!doctype html><title>Loading</title>');
+          c.build.frontendDist = '../shell';
+          fs.writeFileSync(file,JSON.stringify(c));
+          JS
+          if [[ -n "$ICON" ]]; then npm run tauri icon -- "../$ICON"; fi
+          if [[ "$PLATFORM" == windows ]]; then
+            cargo add --manifest-path src-tauri/Cargo.toml rfd@0.15 open@5
+            cat > src-tauri/src/lib.rs <<'RUST'
+          use rfd::{FileDialog, MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
+          use std::{collections::HashMap, path::{Path, PathBuf}, sync::Mutex};
+          use tauri::webview::DownloadEvent;
+          use tauri::Manager;
+
+          fn is_calendar(path: &Path) -> bool {
+              path.extension().and_then(|e| e.to_str())
+                  .is_some_and(|e| e.eq_ignore_ascii_case("ics"))
+          }
+
+          fn message(title: &str, detail: &str) {
+              MessageDialog::new().set_level(MessageLevel::Info)
+                  .set_title(title).set_description(detail).show();
+          }
+
+          pub fn run() {
+              tauri::Builder::default()
+                  .setup(|app| {
+                      let selected = Mutex::new(HashMap::<String, PathBuf>::new());
+                      tauri::WebviewWindowBuilder::from_config(app, &app.config().app.windows[0])?
+                          .on_download(move |_, event| {
+                              match event {
+                                  DownloadEvent::Requested { url, destination } if is_calendar(destination) => {
+                                      let mut dialog = FileDialog::new()
+                                          .set_title("Chọn nơi lưu lịch học")
+                                          .add_filter("iCalendar", &["ics"]);
+                                      if let Some(name) = destination.file_name().and_then(|s| s.to_str()) {
+                                          dialog = dialog.set_file_name(name);
+                                      }
+                                      let Some(path) = dialog.save_file() else { return false };
+                                      if !is_calendar(&path) {
+                                          message("Tên file lịch", "Hãy chọn tên kết thúc bằng .ics.");
+                                          return false;
+                                      }
+                                      selected.lock().unwrap().insert(url.to_string(), path.clone());
+                                      *destination = path;
+                                  }
+                                  DownloadEvent::Finished { url, path, success } => {
+                                      let chosen = selected.lock().unwrap().remove(url.as_str());
+                                      if let Some(chosen) = chosen {
+                                          if !success {
+                                              message("Lưu lịch", "Tải file lịch chưa thành công. Hãy thử lại.");
+                                          } else {
+                                              let saved = path.unwrap_or(chosen);
+                                              if is_calendar(&saved) {
+                                                  let open_now = MessageDialog::new()
+                                                      .set_title("Mở ứng dụng lịch?")
+                                                      .set_description(format!("Đã lưu lịch tại {}. Mở bằng ứng dụng lịch mặc định?", saved.display()))
+                                                      .set_buttons(MessageButtons::YesNo).show();
+                                                  if open_now == MessageDialogResult::Yes && open::that(&saved).is_err() {
+                                                      message("Mở lịch", &format!("Windows chưa mở được file. Chọn ứng dụng lịch cho file .ics rồi mở {}", saved.display()));
+                                                  }
+                                              }
+                                          }
+                                      }
+                                  }
+                                  _ => {}
+                              }
+                              true
+                          }).build()?;
+                      Ok(())
+                  })
+                  .run(tauri::generate_context!())
+                  .expect("failed to start application");
+          }
+          RUST
+          fi
+          case "$PLATFORM" in
+            windows) bundle=nsis; pattern='*-setup.exe' ;;
+            linux) bundle=deb; pattern='*.deb' ;;
+            macos) bundle=dmg; pattern='*.dmg' ;;
+          esac
+          npm run tauri build -- --bundles "$bundle"
+          mkdir -p ../output
+          find src-tauri/target/release/bundle -type f -name "$pattern" -exec cp {} ../output/ \;
+      - uses: actions/setup-java@v4
+        if: matrix.target == 'android' && (inputs.target == 'all' || inputs.target == 'android')
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Generate mobile project with Capacitor
+        if: contains(fromJSON('["android","ios"]'), matrix.target) && (inputs.target == 'all' || inputs.target == matrix.target)
+        env:
+          PLATFORM: ${{ matrix.target }}
+        run: |
+          mkdir mobile output
+          cd mobile
+          npm init -y
+          npm install @capacitor/core@7 @capacitor/cli@7 "@capacitor/$PLATFORM@7"
+          mkdir www
+          echo '<!doctype html><title>Loading</title>' > www/index.html
+          node -e "const e=process.env; require('fs').writeFileSync('capacitor.config.json',JSON.stringify({appId:e.APP_ID,appName:e.TITLE,webDir:'www',server:{url:e.SITE},ios:{zoomEnabled:true}}))"
+          npx cap add "$PLATFORM"
+          if [[ -n "$ICON" ]]; then
+            mkdir assets
+            cp "../$ICON" assets/icon-only.png
+            npx --yes @capacitor/assets@3 generate "--$PLATFORM"
+          fi
+      - name: Build Android test APK
+        if: matrix.target == 'android' && (inputs.target == 'all' || inputs.target == 'android')
+        run: |
+          cd mobile/android
+          bash gradlew assembleDebug
+          cp app/build/outputs/apk/debug/app-debug.apk ../../output/
+      - name: Build unsigned IPA for personal signing
+        if: matrix.target == 'ios' && (inputs.target == 'all' || inputs.target == 'ios')
+        run: |
+          cat >> mobile/ios/App/App/AppDelegate.swift <<'SWIFT'
+
+          import Capacitor
+          import EventKit
+          import UIKit
+
+          class StudyBridgeController: CAPBridgeViewController {
+              override func capacitorDidLoad() {
+                  bridge?.registerPluginInstance(StudyCalendar())
+              }
+          }
+
+          @objc(StudyCalendar)
+          class StudyCalendar: CAPPlugin, CAPBridgedPlugin {
+              let identifier = "StudyCalendar"
+              let jsName = "StudyCalendar"
+              let pluginMethods = [CAPPluginMethod(name: "addPlan", returnType: CAPPluginReturnPromise)]
+              private struct Session: Decodable {
+                  let title: String
+                  let notes: String
+                  let start: Double
+              }
+
+              @objc func addPlan(_ call: CAPPluginCall) {
+                  guard #available(iOS 17, *) else {
+                      call.reject("Requires iPadOS 17 or later.")
+                      return
+                  }
+                  guard let json = call.getString("sessions"),
+                        let sessions = try? JSONDecoder().decode([Session].self, from: Data(json.utf8)),
+                        (1...366).contains(sessions.count), let first = sessions.first,
+                        let duration = call.getInt("duration"), [15,30,45,60].contains(duration),
+                        let alarm = call.getInt("alarm"), [0,5,10,30].contains(alarm) else {
+                      call.reject("Invalid study plan.")
+                      return
+                  }
+                  let vi = call.getString("language") == "vi"
+                  Task { @MainActor in
+                      guard let view = self.bridge?.viewController, view.presentedViewController == nil else {
+                          call.reject("Calendar is busy.")
+                          return
+                      }
+                      let prompt = UIAlertController(title: vi ? "Thêm vào Lịch Apple?" : "Add to Apple Calendar?",
+                          message: vi ? "Thêm \(sessions.count) buổi học vào lịch mặc định?" : "Add \(sessions.count) sessions to your default calendar?",
+                          preferredStyle: .alert)
+                      prompt.addAction(UIAlertAction(title: vi ? "Hủy" : "Cancel", style: .cancel) { _ in
+                          call.resolve(["saved": false])
+                      })
+                      prompt.addAction(UIAlertAction(title: vi ? "Thêm" : "Add", style: .default) { _ in
+                          Task { @MainActor in
+                              let store = EKEventStore()
+                              do {
+                                  guard try await store.requestWriteOnlyAccessToEvents(),
+                                        let calendar = store.defaultCalendarForNewEvents else {
+                                      call.reject(vi ? "Cho phép thêm sự kiện trong Cài đặt → Quyền riêng tư & Bảo mật → Lịch." : "Allow adding calendar events in Settings.")
+                                      return
+                                  }
+                                  for session in sessions {
+                                      let event = EKEvent(eventStore: store)
+                                      event.calendar = calendar
+                                      event.title = session.title
+                                      event.notes = session.notes
+                                      event.startDate = Date(timeIntervalSince1970: session.start)
+                                      event.endDate = event.startDate.addingTimeInterval(Double(duration * 60))
+                                      event.addAlarm(EKAlarm(relativeOffset: -Double(alarm * 60)))
+                                      try store.save(event, span: .thisEvent, commit: false)
+                                  }
+                                  try store.commit()
+                                  let date = Date(timeIntervalSince1970: first.start)
+                                  let url = URL(string: "calshow:\(Int(date.timeIntervalSinceReferenceDate))")!
+                                  let opened = await UIApplication.shared.open(url, options: [:])
+                                  call.resolve(["saved": true, "opened": opened])
+                              } catch {
+                                  store.reset()
+                                  call.reject(error.localizedDescription)
+                              }
+                          }
+                      })
+                      view.present(prompt, animated: true)
+                  }
+              }
+          }
+          SWIFT
+          python3 - <<'PY'
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+          p = Path('mobile/ios/App/App/Base.lproj/Main.storyboard')
+          tree = ET.parse(p)
+          vc = tree.find(".//*[@customClass='CAPBridgeViewController']")
+          if vc is None:
+              raise RuntimeError('Capacitor bridge controller missing from storyboard')
+          vc.set('customClass', 'StudyBridgeController')
+          vc.set('customModule', 'App')
+          vc.set('customModuleProvider', 'target')
+          tree.write(p, encoding='utf-8', xml_declaration=True)
+          PY
+          /usr/libexec/PlistBuddy -c "Add :NSCalendarsWriteOnlyAccessUsageDescription string Add your selected study sessions to Calendar." mobile/ios/App/App/Info.plist
+          xcodebuild -workspace mobile/ios/App/App.xcworkspace -scheme App -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath ios-build CODE_SIGNING_ALLOWED=NO TARGETED_DEVICE_FAMILY=1,2 build
+          mkdir Payload
+          ditto ios-build/Build/Products/Release-iphoneos/App.app Payload/App.app
+          /usr/bin/zip -qry output/App-unsigned.ipa Payload
+      - uses: actions/upload-artifact@v4
+        if: inputs.target == 'all' || inputs.target == matrix.target
+        with:
+          name: app-${{ matrix.target }}
+          path: output/*
+          if-no-files-found: error
+          retention-days: 7
